@@ -1,6 +1,6 @@
 # Adaptive Dual-Branch Fusion: Enhancing Infrared-Visible Image Integration via Cross-Modality Learning
 
-![Overall framework](Overall framework.png)
+![Overall framework](Overall%20framework.png)
 
 
 
