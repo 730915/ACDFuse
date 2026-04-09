@@ -735,6 +735,265 @@ def count_parameters(model):
 
 
 # ============================================================================
+# SEBlock (Squeeze-and-Excitation)
+# ============================================================================
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation 通道注意力模块"""
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+# ============================================================================
+# FADN: Fusion-Enhanced Detection Neck Module (融合 → 检测)
+# ============================================================================
+
+class FADN(nn.Module):
+    """
+    FADN: 将融合特征 F_hfl 注入 YOLOv5 FPN 的残差增强模块
+
+    双重职责:
+    - 前向: F_hfl 经 SEBlock 通道筛选 + 残差注入 YOLOv5 FPN
+    - 反向: 作为检测损失梯度回传至 ACDFuse 编码器的可微通道
+    """
+    def __init__(self, in_channels=64, fpn_channels=[128, 256, 512], reduction=16):
+        super(FADN, self).__init__()
+        self.fpn_channels = fpn_channels  # YOLOv5 FPN 各层通道数 [P3, P4, P5]
+
+        # 红外分支对齐卷积 (参数不共享)
+        self.align_ir = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, fpn_channels[i], kernel_size=1, bias=False),
+                nn.BatchNorm2d(fpn_channels[i])
+            ) for i in range(3)
+        ])
+
+        # 可见光分支对齐卷积 (参数不共享)
+        self.align_vi = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, fpn_channels[i], kernel_size=1, bias=False),
+                nn.BatchNorm2d(fpn_channels[i])
+            ) for i in range(3)
+        ])
+
+        # SEBlock 通道重标定
+        self.se_ir = nn.ModuleList([SEBlock(fpn_channels[i], reduction) for i in range(3)])
+        self.se_vi = nn.ModuleList([SEBlock(fpn_channels[i], reduction) for i in range(3)])
+
+        # 可学习融合系数
+        self.beta_ir = nn.Parameter(torch.tensor(0.5))
+        self.beta_vi = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, f_hfl_ir, f_hfl_vi, fpn_features):
+        """
+        Args:
+            f_hfl_ir: 红外分支融合特征
+            f_hfl_vi: 可见光分支融合特征
+            fpn_features: YOLOv5 FPN 的多尺度特征 [P3, P4, P5]
+        Returns:
+            增强后的 FPN 特征列表
+        """
+        enhanced_fpn = []
+        for i, (f_pn, align_ir, align_vi, se_ir, se_vi) in enumerate(
+                zip(fpn_features, self.align_ir, self.align_vi, self.se_ir, self.se_vi)):
+            # 对齐融合特征到 FPN 分辨率
+            f_hfl_ir_aligned = self._align_features(f_hfl_ir, f_pn, align_ir)
+            f_hfl_vi_aligned = self._align_features(f_hfl_vi, f_pn, align_vi)
+
+            # SE 通道筛选
+            f_hfl_ir_se = se_ir(f_hfl_ir_aligned)
+            f_hfl_vi_se = se_vi(f_hfl_vi_aligned)
+
+            # 残差注入: F_new = F_fpn + β_ir * SE_ir(F_hfl_ir) + β_vi * SE_vi(F_hfl_vi)
+            beta_ir = torch.sigmoid(self.beta_ir)
+            beta_vi = torch.sigmoid(self.beta_vi)
+            f_enhanced = f_pn + beta_ir * f_hfl_ir_se + beta_vi * f_hfl_vi_se
+
+            enhanced_fpn.append(f_enhanced)
+
+        return enhanced_fpn
+
+    def _align_features(self, f_hfl, f_fpn, align_conv):
+        """双线性插值对齐 + 1x1 卷积调整通道"""
+        if f_hfl.shape[2:] != f_fpn.shape[2:]:
+            f_hfl = F.interpolate(f_hfl, size=f_fpn.shape[2:], mode='bilinear', align_corners=False)
+        return align_conv(f_hfl)
+
+
+# ============================================================================
+# TAFFM: Task-Aware Feature Feedback Module (检测 → 融合)
+# ============================================================================
+
+class TAFFM(nn.Module):
+    """
+    TAFFM: 用 YOLOv5 FPN 的多尺度特征 P3/P4/P5 调制 APCA 的注意力因子 α
+
+    目的: 使融合在目标区域更精确，推理时双向互促持续生效
+    """
+    def __init__(self, fpn_channels=[128, 256, 512]):
+        super(TAFFM, self).__init__()
+        self.fpn_channels = fpn_channels
+
+        # 各尺度 1x1 卷积压缩到单通道
+        self.conv_p3 = nn.Sequential(
+            nn.Conv2d(fpn_channels[0], 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(inplace=True)
+        )
+        self.conv_p4 = nn.Sequential(
+            nn.Conv2d(fpn_channels[1], 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(inplace=True)
+        )
+        self.conv_p5 = nn.Sequential(
+            nn.Conv2d(fpn_channels[2], 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(inplace=True)
+        )
+
+        # 可学习加权融合权重
+        self.weight_p3 = nn.Parameter(torch.tensor(1.0))
+        self.weight_p4 = nn.Parameter(torch.tensor(1.0))
+        self.weight_p5 = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, fpn_features, target_size):
+        """
+        Args:
+            fpn_features: YOLOv5 FPN 的多尺度特征 [P3, P4, P5]
+            target_size: 目标分辨率 (h, w)
+        Returns:
+            M_task: 任务感知掩码, 值域 [0,1], shape [B, 1, H, W]
+        """
+        p3, p4, p5 = fpn_features
+
+        # 各尺度上采样到统一分辨率
+        p3_up = F.interpolate(p3, size=target_size, mode='bilinear', align_corners=False)
+        p4_up = F.interpolate(p4, size=target_size, mode='bilinear', align_corners=False)
+        p5_up = F.interpolate(p5, size=target_size, mode='bilinear', align_corners=False)
+
+        # 压缩到单通道
+        s_p3 = self.conv_p3(p3_up)
+        s_p4 = self.conv_p4(p4_up)
+        s_p5 = self.conv_p5(p5_up)
+
+        # 加权融合
+        w3 = torch.sigmoid(self.weight_p3)
+        w4 = torch.sigmoid(self.weight_p4)
+        w5 = torch.sigmoid(self.weight_p5)
+        m_task = w3 * s_p3 + w4 * s_p4 + w5 * s_p5
+
+        # Sigmoid 归一化到 [0,1]
+        m_task = torch.sigmoid(m_task)
+
+        return m_task
+
+
+# ============================================================================
+# APCA with TAFFM Modulation (带任务感知调制的 APCA)
+# ============================================================================
+
+class APCA_TAFFM(nn.Module):
+    """
+    APCA with TAFFM: 在原有 APCA 基础上增加任务感知注意力调制
+    M_task 值域 [0,1]: 目标区域接近1(强化跨模态交互), 背景区域接近0(抑制冗余)
+    """
+    def __init__(self, dim, num_heads, bias=False):
+        super(APCA_TAFFM, self).__init__()
+        self.apca = APCA(dim=dim, num_heads=num_heads, bias=bias)
+        self.dim = dim
+
+    def forward(self, x, y, m_task=None):
+        """
+        Args:
+            x: 红外特征
+            y: 可见光特征
+            m_task: 任务感知掩码 (可选), shape [B, 1, H, W]
+        Returns:
+            调制后的融合特征
+        """
+        if m_task is not None:
+            # 调制 APCA 的自适应因子 alpha
+            original_alpha = self.apca.alpha
+            # alpha_new = alpha * m_task (逐元素调制, m_task 上采样到特征分辨率)
+            b, c, h, w = x.shape
+            if m_task.shape[2:] != (h, w):
+                m_task = F.interpolate(m_task, size=(h, w), mode='bilinear', align_corners=False)
+            # 调制后的 alpha
+            modulated_alpha = original_alpha * m_task
+            # 临时替换 alpha 进行前向传播
+            self.apca.alpha = modulated_alpha.squeeze(1).mean()  # 用均值作为标量调制
+
+        out = self.apca(x, y)
+
+        # 恢复原始 alpha
+        if m_task is not None:
+            self.apca.alpha = original_alpha
+
+        return out
+
+
+# ============================================================================
+# YOLOv5 检测头封装 (简化版, 用于联合训练)
+# ============================================================================
+
+class YOLOv5Head(nn.Module):
+    """
+    简化版 YOLOv5 检测头
+    用于与 ACDFuse 联合训练, 接收 FPN 多尺度特征并输出检测结果
+    """
+    def __init__(self, num_classes=6, fpn_channels=[128, 256, 512], anchors_per_location=3):
+        super(YOLOv5Head, self).__init__()
+        self.num_classes = num_classes
+        self.fpn_channels = fpn_channels
+        self.anchors_per_location = anchors_per_location
+
+        # 每个 FPN 尺度的检测头
+        self.det_heads = nn.ModuleList([
+            nn.Sequential(
+                # 特征提取
+                nn.Conv2d(fpn_channels[i], fpn_channels[i], kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fpn_channels[i]),
+                nn.LeakyReLU(0.1, inplace=True),
+                # 类别预测: (num_classes + 5) * anchors_per_location
+                nn.Conv2d(fpn_channels[i], (num_classes + 5) * anchors_per_location, kernel_size=1)
+            ) for i in range(3)
+        ])
+
+        # 初始化
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, fpn_features):
+        """
+        Args:
+            fpn_features: [P3, P4, P5] 三尺度特征列表
+        Returns:
+            检测输出列表
+        """
+        outputs = []
+        for i, (feat, det_head) in enumerate(zip(fpn_features, self.det_heads)):
+            outputs.append(det_head(feat))
+        return outputs
+
+
+# ============================================================================
 # 兼容性别名 (保留旧名称以兼容已有代码)
 # ============================================================================
 
